@@ -1,33 +1,64 @@
 # Validation
 
-## Public candidate validation (2026-10-19)
+## PR follow-up validation (2026-10-19)
 
-The recipe's executable source, tests and configuration are unchanged from
-private-source commit `6ef655072dedb79d26bcb4782ad29eebcbe96518`.
-The new branch starts at upstream `26590228c049126644e82389da67b30b416ddfae`.
-Only this validation note, the recipe index and unit-test discovery are added
-around that extracted recipe.
+This follow-up fixes four issues found in public revision `a0fe8a4`:
 
-Local Windows checks used Python 3.12.14 and the upstream-pinned Ruff 0.14.10:
+- Use the pinned verl model MTP configuration, including both `enable` and `enable_rollout`.
+- Terminate the probe's process group on timeout or nonzero exit, including workers
+  that survive the leader. Preserve the original failure when the group already exited.
+- Make the TP leader the sole controller/evidence owner and broadcast each final K.
+- Support the audited public Ascend source revision and provide a source-only preflight.
+
+The policy, score, fallback and stabilization defaults are unchanged.
+
+### CPU and packaging
+
+Windows Python 3.12.14 and upstream-pinned Ruff 0.14.10:
 
 - `PYTHONPATH=adaptive_spec python -m pytest tests/ adaptive_spec/tests/ -q --tb=short`:
-  **398 passed** (331 upstream + 67 recipe), no skips.
-- `python -m ruff check .`: passed.
-- `python -m ruff format --check .`: passed, 189 files formatted.
-- Python 3.10 syntax parsing: passed; this is not a Python 3.10 runtime execution.
-- `python -m build --outdir ../validation/dist adaptive_spec`: wheel and sdist built.
-- The built wheel was installed into a fresh isolated environment with `--no-index --no-deps`.
-  Disabled-plugin import and both plugin entry-point loads passed without importing
-  torch, Ray, vLLM or vLLM-Ascend.
+  **408 passed** (331 upstream + 77 recipe), no skips.
+- Repository-wide Ruff lint and format checks passed (193 Python files).
+- Python 3.10 syntax parsing passed; this is not Python 3.10 runtime execution.
+- Wheel/sdist build, fresh isolated wheel installation, disabled-plugin import and both
+  plugin entry-point loads passed without loading torch, Ray or the inference backend.
 
-The first local build used `--no-isolation` in a pre-existing test environment
-without setuptools and failed before building. The normal isolated build above
-installed its declared build backend and passed; no source fix was needed.
+The regressions cover evidence arriving between TP rank calls under the default
+64-decision polling/two-confirmation settings, leader-only publication, propagated
+leader errors, ordered decision packets, probe cleanup and modified-source rejection.
 
-No new framework, training, device-generation or performance run was performed
-for this public candidate. Full verl/Ray execution, optional Elastic device
-integration, quality checks and matched package throughput remain pending.
-This submission is a Draft for author and maintainer review.
+A separate Linux/Python 3.11 test used actual two-process PyTorch Gloo communication
+and the pinned vLLM `GroupCoordinator.broadcast_object` method. All 129 decisions
+agreed across ranks, including K5→K9 after shared evidence polling. An injected leader
+policy error reached both ranks. This is a communication regression, not model generation.
+
+### Native TP2 generation on public backend source
+
+The follow-up wheel was tested with Qwen3.5-9B, Python 3.11.10, PyTorch 2.10.0,
+torch-npu 2.10.0.post2, vLLM 0.23.0 and vLLM-Ascend
+0.23.0rc2.dev1+g5ed283a6c.d20260719. The public Ascend runner at
+`5ed283a6c0ff5508f060d6203bc7a34e9d38c7bb` was mounted read-only over the installed
+runner in an isolated validation container; existing compiled extensions were retained.
+The public runner and core vLLM source passed preflight. This did not rebuild or
+certify a complete backend wheel from scratch.
+
+Two new requests each completed 128 tokens with eager asynchronous serial MTP,
+TP2, B2 and startup capacity K7. Both workers agreed on all **47** decisions;
+physical depth changed **K5→K7→K5** and returned draft shapes passed the adapter's
+width checks. Only rank zero owned a controller. Test-only worker readback used a
+named extension method; no arbitrary-callable RPC permission was enabled.
+
+Synthetic phase fallbacks and shorter dwell were used to force both transitions.
+This tests transport and control correctness; it is not a calibrated performance
+comparison or output-quality equivalence test. Test instrumentation is outside the
+recipe. Logs, source manifests and restoration receipts are retained separately.
+
+### Remaining integration coverage
+
+Full supported-stack verl/Ray training, optional Elastic device integration, output
+quality and matched package throughput remain pending. The native vLLM test above
+does not establish training convergence or an Elastic × dynamic-K interaction gain.
+Historical results below retain their original measurement boundary.
 
 ## Historical provenance (2026-10-09)
 

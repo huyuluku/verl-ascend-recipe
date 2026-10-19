@@ -30,7 +30,7 @@ from importlib import machinery
 from pathlib import Path
 from typing import Any
 
-from .mtp_copy_v0_23 import _COPY_SHA, _guard
+from .mtp_copy_v0_23 import _COPY_SHAS, _guard
 from .v0_23 import _is_eager
 
 _TARGET = "vllm_ascend.worker.model_runner_v1"
@@ -80,9 +80,9 @@ def patch_class(cls: Any, plan: dict, output: Path) -> None:
         return
     if getattr(cls, "_verl_adaptive_spec_v0_23", False):
         raise RuntimeError("offline calibration cannot coexist with online depth control")
-    _guard(cls.execute_model, _COPY_SHA)
-    _guard(cls._bookkeeping_sync, _COPY_SHA)
-    _guard(cls.sample_tokens, _COPY_SHA)
+    _guard(cls.execute_model, _COPY_SHAS)
+    _guard(cls._bookkeeping_sync, _COPY_SHAS)
+    _guard(cls.sample_tokens, _COPY_SHAS)
     original_execute, original_bookkeeping = cls.execute_model, cls._bookkeeping_sync
     original_sample = cls.sample_tokens
     signature = inspect.signature(original_bookkeeping)

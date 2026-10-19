@@ -22,6 +22,7 @@ adaptive_spec_calibration_plugin = "adaptive_spec.vllm_plugin.calibration_v0_23:
 [project.scripts]
 adaptive-spec-collect = "adaptive_spec.calibration:main"
 adaptive-spec-build-contexts = "adaptive_spec.context_bank:main"
+adaptive-spec-check-backend = "adaptive_spec.backend:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

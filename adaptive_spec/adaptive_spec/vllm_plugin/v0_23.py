@@ -124,11 +124,58 @@ def _logical_draft_count(raw_count: int, previous_k: int) -> int:
 def _runtime_state(runner: Any, config: AdaptiveSpecConfig) -> dict[str, Any] | None:
     if hasattr(runner, _STATE_ATTR):
         return getattr(runner, _STATE_ATTR)
-    controller = config.build_controller()
-    state = None if controller is None else {"controller": controller, "rollout_step": None}
+    if not config.enabled or config.phase_map_path is None:
+        state = None
+    else:
+        group = _tensor_parallel_group(runner)
+        leader = group is None or group.rank_in_group == 0
+        state = {
+            "controller": config.build_controller() if leader else None,
+            "rollout_step": None,
+            "tp_group": group,
+            "decision_round": 0,
+        }
     setattr(runner, _STATE_ATTR, state)
     setattr(runner, _REQUESTS_ATTR, {})
     return state
+
+
+def _tensor_parallel_group(runner: Any) -> Any:
+    parallel = runner.vllm_config.parallel_config
+    size = int(parallel.tensor_parallel_size)
+    if size == 1:
+        return None
+    from vllm.distributed import get_tp_group
+
+    group = get_tp_group()
+    if group.world_size != size or not 0 <= group.rank_in_group < size:
+        raise RuntimeError("AdaptiveSpec TP group does not match the Engine configuration")
+    return group
+
+
+def _select_engine_k(state: dict[str, Any], contexts: list[RequestContext]) -> int:
+    """Use one authority per Engine, including filesystem evidence visibility."""
+    group = state.get("tp_group")
+    if group is None:
+        return state["controller"].decide_engine(contexts).physical_k
+    packet = None
+    decision_round = state["decision_round"]
+    if group.rank_in_group == 0:
+        try:
+            k = state["controller"].decide_engine(contexts).physical_k
+            packet = (decision_round, int(k), None)
+        except Exception as error:
+            # All ranks must leave this collective before reporting a policy failure.
+            packet = (decision_round, None, f"{type(error).__name__}: {error}")
+    packet = group.broadcast_object(packet, src=0)
+    if not isinstance(packet, tuple) or len(packet) != 3 or packet[0] != decision_round:
+        raise RuntimeError("AdaptiveSpec received an out-of-order TP decision")
+    if packet[2] is not None:
+        raise RuntimeError(f"AdaptiveSpec TP leader decision failed: {packet[2]}")
+    if type(packet[1]) is not int:
+        raise RuntimeError("AdaptiveSpec TP leader did not broadcast an integer K")
+    state["decision_round"] += 1
+    return packet[1]
 
 
 def _request_contexts(runner: Any) -> list[RequestContext]:
@@ -176,7 +223,7 @@ def _finalize_previous(runner: Any, scheduler_output: Any, state: dict[str, Any]
     pending = getattr(runner, _PENDING_ATTR, None)
     if pending is not None:
         rows = pending["rows"]
-        emitted_counts = _accepted_counts(runner, len(rows))
+        emitted_counts = _accepted_counts(runner, len(rows)) if controller is not None else ()
         for row, emitted in zip(rows, emitted_counts, strict=False):
             if row["discarded"]:
                 continue
@@ -194,7 +241,7 @@ def _finalize_previous(runner: Any, scheduler_output: Any, state: dict[str, Any]
     registry = getattr(runner, _REQUESTS_ATTR)
     for request_id in getattr(scheduler_output, "finished_req_ids", ()):
         context = registry.pop(str(request_id), None)
-        if context is not None:
+        if context is not None and controller is not None:
             controller.finish_request(context)
 
 
@@ -314,14 +361,15 @@ def _patch_class(model_runner_cls: Any, config: AdaptiveSpecConfig) -> bool:
                 raise RuntimeError("one Engine batch cannot mix adaptive-spec rollout steps")
             step = steps.pop()
             if state["rollout_step"] != step:
-                state["controller"].reset_step()
+                if state["controller"] is not None:
+                    state["controller"].reset_step()
                 getattr(self, _REQUESTS_ATTR).clear()
                 for context in contexts:
                     getattr(self, _REQUESTS_ATTR)[context.request_id] = context
                 state["rollout_step"] = step
-            decision = state["controller"].decide_engine(contexts)
-            if _apply_engine_k(self, decision.physical_k, require_eager=config.require_eager):
-                selected_k = decision.physical_k
+            physical_k = _select_engine_k(state, contexts)
+            if _apply_engine_k(self, physical_k, require_eager=config.require_eager):
+                selected_k = physical_k
         result = original_propose(
             self,
             valid_sampled_token_ids,

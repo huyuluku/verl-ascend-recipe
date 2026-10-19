@@ -29,6 +29,8 @@ Model-runner and scheduler private methods also have exact source-hash guards. A
 alone does not establish compatibility; vendor rebuilds with different source are refused.
 The supported depth range is positive K up to the fixed startup capacity; K=11 is excluded.
 This recipe does not enable K=0, parallel drafting, DSD, graph execution or 0.24 adapters.
+Use the public revisions and source-install instructions in [BACKEND.md](BACKEND.md), then run
+`adaptive-spec-check-backend` on each worker before calibration or rollout.
 
 ## Policy and defaults
 
@@ -44,6 +46,9 @@ after a switch, and one step on the **global** candidate ladder. During a transi
 physical K can be an intermediate global candidate outside the current phase's candidate
 subset. This is historical behavior; the phase subset is a recommendation set, not an
 instantaneous hard constraint. Startup capacity must cover the global ladder.
+Within each Engine, the TP leader owns the controller and evidence lifecycle. It broadcasts
+the final K to all TP ranks before drafting; followers do not independently poll evidence or
+publish duplicate response statistics.
 
 Evidence observations retain historical per-response B/L phase attribution; the Engine
 queries its common B/P90 phase. Evidence is therefore not shared approximately across lengths.
@@ -97,9 +102,14 @@ Finish, discard and step reset clean the cache. No approximate prompt or phase m
    ```text
    actor_rollout_ref.rollout.agent.agent_loop_manager_class=adaptive_spec.verl_integration.AdaptiveSpecAgentLoopManager
    actor_rollout_ref.rollout.enforce_eager=true
-   actor_rollout_ref.rollout.mtp.enable_rollout=true
-   actor_rollout_ref.rollout.mtp.num_speculative_tokens=12
+   actor_rollout_ref.model.mtp.enable=true
+   actor_rollout_ref.model.mtp.enable_rollout=true
+   actor_rollout_ref.model.mtp.num_speculative_tokens=12
    ```
+
+   The pinned verl configuration inherits rollout MTP settings from `model.mtp`.
+   Set both `enable` and `enable_rollout` there; overriding only `rollout.mtp`
+   can replace that inherited configuration without enabling MTP.
 
    `12` is an example startup capacity; use a capacity covering your phase map. Keep your model,
    data, actor, reward, batch and parallel settings. The custom manager only propagates the
@@ -146,8 +156,10 @@ python -m build adaptive_spec
 
 Tests are CPU regression tests, including historical policy behavior, censoring, exact key-cache
 identity, preceding-K attribution, raw-count selection, guarded private APIs and router lifecycle.
-Mocked callbacks are not a full verl/Ray/NPU run. The freshly extracted package needs an actual
-supported-stack smoke and natural rollout before claiming end-to-end compatibility or gains.
+The TP fix also passed a real two-process Gloo regression and a native Ascend TP2 short-generation
+test on the public backend source, including physical K5→K7→K5 transitions. See
+[VALIDATION.md](VALIDATION.md). Full verl/Ray training and representative rollout performance
+are separate validation steps.
 Historical experimental speedups are not performance measurements of this delivery revision.
 The online control path contains no profiling, decision journals or experimental controller flags.
 The explicit offline collector writes calibration artifacts only to its requested output directory.

@@ -19,16 +19,19 @@ import inspect
 from functools import wraps
 from pathlib import Path
 
+from ..backend import ASCEND_RUNNER_SOURCES, VLLM_RUNNER_SHA256
+
 _MARKER = "_verl_mtp_variable_copy_v023"
 _SNAPSHOT = "_verl_mtp_cpu_draft_snapshot_v023"
-_COPY_SHA = "cd0abab15168fa7cb6b094b8f1861975e7c9ab562d29fc0fde9906435f1e96cf"
-_READ_SHA = "6250ca0670c4593aa2f7c4567c9c71d6cb3d8182624a985d4d4e33d5bf054666"
+_COPY_SHAS = frozenset(ASCEND_RUNNER_SOURCES)
+_READ_SHA = VLLM_RUNNER_SHA256
 
 
 def _guard(method, expected):
     method = inspect.unwrap(method)
     path = inspect.getsourcefile(method)
-    if path is None or hashlib.sha256(Path(path).read_bytes()).hexdigest() != expected:
+    allowed = {expected} if isinstance(expected, str) else expected
+    if path is None or hashlib.sha256(Path(path).read_bytes()).hexdigest() not in allowed:
         raise RuntimeError("0.23 draft transport source fingerprint mismatch")
     return method
 
@@ -41,7 +44,7 @@ def patch_copy_and_read(runner_class):
         if not all(marked):
             raise RuntimeError("Partial 0.23 draft transport installation")
         return False
-    copy_source = _guard(copy, _COPY_SHA)
+    copy_source = _guard(copy, _COPY_SHAS)
     _guard(read, _READ_SHA)
     torch = copy_source.__globals__["torch"]
 

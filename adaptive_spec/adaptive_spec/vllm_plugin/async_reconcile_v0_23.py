@@ -14,11 +14,10 @@
 
 """Pinned 0.23 MTP worker-local trim and optimistic-count restoration."""
 
-import hashlib
-import inspect
 from copy import copy
 from functools import wraps
-from pathlib import Path
+
+from .mtp_copy_v0_23 import _COPY_SHAS, _guard
 
 
 def prepare_worker_schedule(runner, schedule):
@@ -70,14 +69,6 @@ def prepare_worker_schedule(runner, schedule):
 
 _MARKER = "_verl_mtp_async_reconcile_v023"
 _STATE = "_verl_mtp_async_restore_v023"
-_SOURCE_SHA = "cd0abab15168fa7cb6b094b8f1861975e7c9ab562d29fc0fde9906435f1e96cf"
-
-
-def _guard(method):
-    method = inspect.unwrap(method)
-    path = inspect.getsourcefile(method)
-    if path is None or hashlib.sha256(Path(path).read_bytes()).hexdigest() != _SOURCE_SHA:
-        raise RuntimeError("0.23 async runner source fingerprint mismatch")
 
 
 def wrap_methods(original_execute, original_update):
@@ -131,7 +122,7 @@ def patch_class(cls):
         if not all(marked):
             raise RuntimeError("Partial 0.23 async reconciliation installation")
         return False
-    _guard(execute)
-    _guard(update)
+    _guard(execute, _COPY_SHAS)
+    _guard(update, _COPY_SHAS)
     cls.execute_model, cls._update_states = wrap_methods(execute, update)
     return True

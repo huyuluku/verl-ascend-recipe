@@ -6,6 +6,9 @@ phase-map schema consumed by the historical controller. It does not run adaptive
 depth selection or Elastic during calibration and adds no measurement calls to
 ordinary rollout jobs.
 
+Prepare the [pinned public backend](BACKEND.md) and run `adaptive-spec-check-backend`
+before starting device probes. A version string alone does not identify the guarded source.
+
 ## 1. Prepare representative natural contexts
 
 Use token IDs from an existing natural calibration rollout made with the same

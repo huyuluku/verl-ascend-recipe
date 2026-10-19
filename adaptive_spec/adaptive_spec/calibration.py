@@ -280,6 +280,24 @@ def reduce_records(plan: dict[str, Any], records: list[dict[str, Any]], *, backe
     return result
 
 
+def _stop_probe_group(process: subprocess.Popen) -> None:
+    """Stop the session created for one probe, including surviving workers."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    # wait() only reaps the leader. Workers may survive even when it returns.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
 def collect(plan: dict[str, Any], output: Path, *, backend: str, replay: Path | None = None) -> None:
     output.mkdir(parents=True, exist_ok=False)
     write_json(output / "plan.resolved.json", plan)
@@ -319,16 +337,10 @@ def collect(plan: dict[str, Any], output: Path, *, backend: str, replay: Path | 
                     try:
                         process.wait(timeout=plan["probe_timeout_seconds"])
                     except BaseException:
-                        # Only the process group created for this probe is stopped.
-                        # Killing just the parent would orphan model-worker processes.
-                        os.killpg(process.pid, signal.SIGTERM)
-                        try:
-                            process.wait(timeout=10)
-                        except subprocess.TimeoutExpired:
-                            os.killpg(process.pid, signal.SIGKILL)
-                            process.wait()
+                        _stop_probe_group(process)
                         raise
                 if process.returncode:
+                    _stop_probe_group(process)
                     raise RuntimeError(f"fixed-K probe failed: K={k}; see {probe_dir / 'run.log'}")
                 receipt = json.loads((probe_dir / "result.json").read_text(encoding="utf-8"))
                 if receipt.get("status") != "complete":
