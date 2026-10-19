@@ -49,7 +49,7 @@ class PredictionProvenance:
 
 @dataclass(frozen=True)
 class LengthPrediction:
-    """Token-scale work prediction used by EPWS."""
+    """Token-scale work prediction used by EWS."""
 
     median: float
     p90: float

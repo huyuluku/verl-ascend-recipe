@@ -1,4 +1,4 @@
-"""Recipe-side AgentLoopManager with event-driven waiting-pool admission."""
+"""Recipe-side EWS AgentLoopManager with event-driven waiting-pool admission."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ class EPWSAgentLoopManager(VerlAgentLoopManager):
 
     This class uses verl's documented ``agent_loop_manager_class`` extension
     point. Server selection remains delegated to verl's existing
-    ``GlobalRequestLoadBalancer``; EPWS controls only request admission.
+    ``GlobalRequestLoadBalancer``; EWS controls only request admission.
     """
 
     @auto_await

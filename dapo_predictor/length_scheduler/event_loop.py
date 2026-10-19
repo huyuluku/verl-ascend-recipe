@@ -1,4 +1,4 @@
-"""Small async primitive used by the recipe-side EPWS manager."""
+"""Small async primitive used by the recipe-side EWS manager."""
 
 from __future__ import annotations
 

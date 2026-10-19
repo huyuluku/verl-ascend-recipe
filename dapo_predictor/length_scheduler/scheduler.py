@@ -1,4 +1,4 @@
-"""No-anchor Event-driven Pending/Waiting-pool Scheduler (EPWS)."""
+"""No-anchor Event-driven Waiting-pool Scheduler (EWS)."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-# DAPO predictor + EPWS — tested against the rolling DAPO pin
+# DAPO predictor + EWS — tested against the rolling DAPO pin
 UPSTREAM=https://github.com/verl-project/verl.git
 MODE=pinned_commit
 COMMIT=bcb638649a50e58494a8ddd92085ad1174f674b8

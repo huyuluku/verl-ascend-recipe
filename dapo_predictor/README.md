@@ -1,11 +1,11 @@
-# DAPO length predictor and EPWS
+# DAPO length predictor and EWS
 
 This recipe adds two orthogonal components to DAPO rollout generation:
 
 1. a prompt-side response-length predictor; and
-2. an event-driven pending/waiting-pool scheduler (EPWS).
+2. an Event-driven Waiting-pool Scheduler (EWS).
 
-EPWS has a deterministic fail-closed mode. Before the selected predictor passes its activation gates, EPWS admits requests in stable FCFS order. After activation it admits the longest predicted work first and refills the bounded rollout window whenever one request completes. Actual inference-server placement remains owned by verl's existing `GlobalRequestLoadBalancer`.
+EWS has a deterministic fail-closed mode. Before the selected predictor passes its activation gates, EWS admits requests in stable FCFS order. After activation it admits the longest predicted work first and refills the bounded rollout window whenever one request completes. Actual inference-server placement remains owned by verl's existing `GlobalRequestLoadBalancer`.
 
 The implementation uses verl's public `agent_loop_manager_class` extension point. It does not patch vLLM or vLLM-Ascend and does not require either project as a Python dependency of the scheduler package.
 
@@ -40,13 +40,13 @@ cp -a /path/to/verl-ascend-recipe/dapo_predictor recipe/dapo_predictor
 pip install -e .
 ```
 
-Run the commands below from the verl checkout with that checkout on `PYTHONPATH`. The upstream DAPO recipe remains the owner of the base trainer configuration; this overlay adds predictor and EPWS behavior through the documented extension point.
+Run the commands below from the verl checkout with that checkout on `PYTHONPATH`. The upstream DAPO recipe remains the owner of the base trainer configuration; this overlay adds predictor and EWS behavior through the documented extension point.
 
 ## Product boundary
 
 Included in the first contribution:
 
-- no-anchor EPWS with deterministic FCFS fallback;
+- no-anchor EWS with deterministic FCFS fallback;
 - D1 `Linear/ListMLE` as the default online backend;
 - train-history-only PAVA calibration from ranking score to token-scale work;
 - a two-part activation gate (`min_epoch` and `min_samples`);
@@ -67,7 +67,7 @@ Not enabled or submitted as product behavior:
 ## Runtime flow
 
 1. The trainer repeats each prompt by `rollout.n` as usual.
-2. If the selected predictor has not passed both activation gates, no predictor forward is run and EPWS behaves as stable FCFS.
+2. If the selected predictor has not passed both activation gates, no predictor forward is run and EWS behaves as stable FCFS.
 3. Once active, the actor performs one prompt-side forward per unique prompt. All sibling rollouts share that prompt prediction.
 4. D1 maps the scalar ListMLE score to token work using a train-history-only monotone PAVA map. D2 uses `median + risk_weight * (p90 - median)`.
 5. `EPWSAgentLoopManager` keeps a bounded set of rollout requests in flight. Each completion immediately admits the next request; active mode is longest-predicted-work-first.
@@ -78,7 +78,7 @@ Not enabled or submitted as product behavior:
 
 | Module | Responsibility |
 | --- | --- |
-| `main_dapo_predictor_reorder.py` | DAPO entry point; selects the custom actor worker and installs EPWS through verl's manager extension. |
+| `main_dapo_predictor_reorder.py` | DAPO entry point; selects the custom actor worker and installs EWS through verl's manager extension. |
 | `predictor_dapo_trainer.py` | Lifecycle gates, prompt-side scoring, predictor update, and predictor checkpoint state. |
 | `predictor_worker.py` | Hidden-state extraction, D1 online training/calibration, and optional D2 inference. |
 | `epws_manager.py` | Event-driven bounded admission and output-order restoration. |
@@ -93,13 +93,15 @@ Not enabled or submitted as product behavior:
 
 ### D1: Linear/ListMLE (default)
 
-D1 is a bias-free linear ranking head over the final prompt-token hidden state. It is trained online with ListMLE. Since a ranking score has no token unit, the worker retains a bounded training-history replay and refits a monotone PAVA map after each update. PAVA sees only already-completed training rows. Until at least two valid calibration observations exist, the predictor reports not ready and EPWS remains FCFS.
+D1 is a bias-free linear ranking head over the final prompt-token hidden state. It is trained online with ListMLE. Since a ranking score has no token unit, the worker retains a bounded training-history replay and refits a monotone PAVA map after each update. PAVA sees only already-completed training rows. Until at least two valid calibration observations exist, the predictor reports not ready and EWS remains FCFS.
 
 ### D2: censored LogNormal (optional)
 
 D2 consumes the hidden-state tap schema declared by a frozen checkpoint and exposes unstandardized `mu`, `sigma`, expected length, median, p90, p95, and exceedance probability. It is useful when downstream systems need a distribution rather than only an ordering. D2 checkpoints must be produced independently and supplied with `d2_checkpoint`; this recipe does not train D2 online.
 
 ## Configuration
+
+The scheduler is named EWS. Existing `epws` configuration keys, Python identifiers (including `EPWSAgentLoopManager`), and metric names are retained for backward compatibility. This naming update does not change scheduling behavior.
 
 The entry point mirrors `trainer.predictor_reorder` into the actor worker config.
 
