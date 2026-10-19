@@ -1,0 +1,4 @@
+include REQUIRED_VERL.txt
+include CALIBRATION.md
+recursive-include examples *.json *.yaml
+recursive-include scripts *.py
