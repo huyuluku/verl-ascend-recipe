@@ -53,8 +53,10 @@ def build_lifecycle_state(
     }
     if backend == DISTRIBUTION_BACKEND:
         if d2_checkpoint is None:
-            raise ValueError("d2_checkpoint is required for censored_lognormal")
-        state["d2_checkpoint_sha256"] = file_sha256(d2_checkpoint)
+            if ready:
+                raise ValueError("d2_checkpoint is required for a ready censored_lognormal predictor")
+        else:
+            state["d2_checkpoint_sha256"] = file_sha256(d2_checkpoint)
     return state
 
 
@@ -90,6 +92,8 @@ def validate_lifecycle_state(
         if schema_version < SCHEMA_VERSION:
             raise ValueError("legacy lifecycle state cannot safely resume censored_lognormal")
         expected_digest = state.get("d2_checkpoint_sha256")
+        if expected_digest is None and d2_checkpoint is None and not ready:
+            return observed_rollouts, ready
         if not isinstance(expected_digest, str) or len(expected_digest) != 64:
             raise ValueError("D2 lifecycle state is missing a valid checkpoint SHA-256")
         if d2_checkpoint is None:

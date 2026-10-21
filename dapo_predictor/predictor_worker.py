@@ -23,6 +23,7 @@ from verl.workers.actor.dp_actor import DataParallelPPOActor
 from verl.workers.fsdp_workers import AsyncActorRolloutRefWorker
 
 from .length_scheduler.calibration import MonotoneCalibration, fit_pava
+from .length_scheduler.checkpoint import file_sha256
 from .length_scheduler.predictor import CensoredLogNormalPredictor
 
 
@@ -290,9 +291,12 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
             backend = str(cfg.get("backend", "linear_listmle"))
             if backend == "censored_lognormal":
                 checkpoint = cfg.get("d2_checkpoint")
-                if not checkpoint:
+                quality_enabled = cfg.get("d2_lifecycle", {}).get("enable", True)
+                if not checkpoint and not quality_enabled:
                     raise ValueError("predictor_reorder.d2_checkpoint is required for censored_lognormal")
-                self.actor.distribution_predictor = CensoredLogNormalPredictor.from_checkpoint(checkpoint)
+                self.actor.distribution_predictor = (
+                    CensoredLogNormalPredictor.from_checkpoint(checkpoint) if checkpoint else None
+                )
             elif backend != "linear_listmle":
                 raise ValueError("predictor_reorder.backend must be 'linear_listmle' or 'censored_lognormal'")
 
@@ -304,6 +308,20 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         if cfg is None:
             cfg = OmegaConf.select(self.config, "trainer.predictor_reorder", default=None)
         return cfg or {}
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_d2_candidate(self, path: str, expected_sha256: str) -> None:
+        """Load one admitted immutable candidate on every actor rank, never train it."""
+        if str(self._predictor_cfg().get("backend", "linear_listmle")) != "censored_lognormal":
+            raise RuntimeError("load_d2_candidate is only valid for censored_lognormal")
+        if file_sha256(path) != expected_sha256:
+            raise ValueError("D2 candidate SHA-256 differs on an actor rank")
+        candidate = CensoredLogNormalPredictor.from_checkpoint(path)
+        if file_sha256(path) != expected_sha256:
+            raise ValueError("D2 candidate changed while loading")
+        self.actor.distribution_predictor = candidate
+        # The blocking ONE_TO_ALL RPC is the rendezvous. An extra collective
+        # would strand healthy ranks if another rank rejects a bad file.
 
     def _actor_params_are_offloaded(self) -> bool:
         """Check whether FSDP actor parameters are currently on CPU."""
@@ -471,8 +489,15 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
             predictor_scores[sample_idx : min(sample_idx + n, batch_size)] = scores[i]
             predicted_work[sample_idx : min(sample_idx + n, batch_size)] = predicted_work_per_prompt[i]
 
+        tensors = {"predictor_scores": predictor_scores, "epws_predicted_work": predicted_work}
+        if backend == "censored_lognormal":
+            for key in ("expected", "median", "p90"):
+                values = torch.tensor(
+                    [getattr(row, key) for row in predictions], device=scores.device, dtype=torch.float32
+                )
+                tensors[f"d2_{key}"] = values.repeat_interleave(n)[:batch_size]
         output = DataProto.from_dict(
-            tensors={"predictor_scores": predictor_scores, "epws_predicted_work": predicted_work},
+            tensors=tensors,
             meta_info={"predictor_ready": predictor_ready, "predictor_backend": backend},
         ).to("cpu")
         if self._pending_offload_param_restore is not None:

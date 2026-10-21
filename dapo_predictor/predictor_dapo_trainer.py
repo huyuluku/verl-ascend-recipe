@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
+import warnings
 from collections import defaultdict
 from copy import deepcopy
 from pprint import pprint
@@ -33,6 +35,7 @@ from .length_scheduler.checkpoint import (
     build_lifecycle_state,
     validate_lifecycle_state,
 )
+from .length_scheduler.d2_quality import D2QualityConfig, D2QualityLifecycle
 from .predictor_utils import snake_sort_indices
 
 
@@ -58,8 +61,91 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
         return backend
 
     def _d2_checkpoint(self) -> str | None:
+        quality = getattr(self, "_d2_quality", None)
+        if quality is not None and quality.checkpoint:
+            return quality.checkpoint
         checkpoint = self._predictor_cfg().get("d2_checkpoint")
         return None if checkpoint is None else str(checkpoint)
+
+    def _d2_quality_enabled(self) -> bool:
+        return self._predictor_backend() == DISTRIBUTION_BACKEND and bool(
+            self._predictor_cfg().get("d2_lifecycle", {}).get("enable", True)
+        )
+
+    def _init_d2_quality(self):
+        self._d2_quality = None
+        if not self._d2_quality_enabled():
+            return
+        if self._scheduler_name() != "epws":
+            raise ValueError("D2 quality lifecycle requires scheduler=epws; disable it explicitly for legacy snake")
+        cfg = self._predictor_cfg()
+        lifecycle = cfg.get("d2_lifecycle", {})
+        activation = cfg.get("activation", {})
+        config = D2QualityConfig.from_mapping(
+            lifecycle.get("quality", {}),
+            warmup_epochs=int(activation.get("min_epoch", 10)),
+            interval_epochs=int(lifecycle.get("interval_epochs", 5)),
+            risk_weight=float(cfg.get("risk_weight", 0.5)),
+        )
+        self._d2_quality = D2QualityLifecycle(config)
+        if self.config.trainer.total_epochs < 20:
+            warnings.warn(
+                "D2 warm-up has limited amortization below 20 RL epochs; 20 is a recommendation, not a gate.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    def _d2_epoch_boundary(self, completed_epochs: int):
+        quality = getattr(self, "_d2_quality", None)
+        if quality is None or not quality.due(completed_epochs):
+            return
+        activation = self._predictor_cfg().get("activation", {})
+        if not quality.active and self._predictor_observed_rollouts < int(activation.get("min_samples", 2560)):
+            return
+        previous_hash = quality.checkpoint_sha256
+        report = self._predictor_cfg().get("d2_lifecycle", {}).get("candidate_report")
+        decision = quality.boundary(completed_epochs, report)
+        self._predictor_ready = quality.active
+        if quality.active and quality.checkpoint_sha256 != previous_hash:
+            # Synchronous all-rank load must finish before any scheduled batch.
+            # An RPC failure aborts instead of silently running mixed predictors.
+            self.actor_rollout_wg.load_d2_candidate(quality.checkpoint, quality.checkpoint_sha256)
+        print(f"D2 quality boundary: {json.dumps(decision, sort_keys=True)}")
+
+    def _observe_d2_rollout(self, predictions: DataProto, completed: DataProto, epoch: int):
+        quality = getattr(self, "_d2_quality", None)
+        if quality is None or not quality.active:
+            return
+        keys = ("d2_expected", "d2_median", "d2_p90")
+        if not predictions.meta_info.get("epws_predictor_active") or not all(k in predictions.batch for k in keys):
+            return  # Missing monitoring evidence suspends D2 at the next boundary.
+        if "response_mask" in completed.batch:
+            response_mask = completed.batch["response_mask"]
+        else:
+            response_width = completed.batch["responses"].shape[-1]
+            response_mask = completed.batch["attention_mask"][:, -response_width:]
+        lengths = response_mask.sum(-1).detach().cpu().tolist()
+        cap = int(self.config.actor_rollout_ref.rollout.response_length)
+        prompt_ids = predictions.batch["input_ids"].detach().cpu()
+        mask = predictions.batch["attention_mask"].detach().cpu().bool()
+        forecasts = [predictions.batch[k].detach().cpu().tolist() for k in keys]
+        for i, observed in enumerate(lengths):
+            identity = hashlib.sha256(json.dumps(prompt_ids[i][mask[i]].tolist()).encode()).hexdigest()
+            try:
+                quality.window.add(
+                    prompt_id=identity,
+                    epoch=epoch + 1,
+                    observed=observed,
+                    expected=forecasts[0][i],
+                    median=forecasts[1][i],
+                    p90=forecasts[2][i],
+                    censored=observed >= cap,
+                )
+            except ValueError:
+                quality.status = "suspended"
+                self._predictor_ready = False
+                warnings.warn("Invalid D2 monitor row: scheduling falls back to FCFS", UserWarning, stacklevel=2)
+                break
 
     def _save_checkpoint(self):
         super()._save_checkpoint()
@@ -75,6 +161,9 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
             ready=self._predictor_ready,
             d2_checkpoint=self._d2_checkpoint(),
         )
+        if getattr(self, "_d2_quality", None) is not None:
+            state["d2_quality"] = self._d2_quality.state_dict()
+            state["d2_rl_epoch"] = getattr(self, "_d2_rl_epoch", 0)
         temporary_state_path = f"{state_path}.tmp-{uuid.uuid4().hex}"
         with open(temporary_state_path, "w", encoding="utf-8") as stream:
             json.dump(state, stream, sort_keys=True)
@@ -91,6 +180,14 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
         with open(state_path, encoding="utf-8") as stream:
             state = json.load(stream)
         backend = self._predictor_backend()
+        if getattr(self, "_d2_quality", None) is not None:
+            if "d2_quality" not in state:
+                print("Legacy D2 checkpoint has no quality evidence; restarting admission in FCFS")
+                return result
+            self._d2_quality.load_state_dict(state["d2_quality"])
+            self._d2_rl_epoch = int(state.get("d2_rl_epoch", 0))
+            if self._d2_quality.checkpoint:
+                self.actor_rollout_wg.load_d2_candidate(self._d2_quality.checkpoint, self._d2_quality.checkpoint_sha256)
         observed_rollouts, ready = validate_lifecycle_state(
             state,
             backend=backend,
@@ -113,6 +210,9 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
 
     def _predictor_active(self, epoch: int) -> bool:
         activation = self._predictor_cfg().get("activation", {})
+        quality = getattr(self, "_d2_quality", None)
+        if quality is not None and not quality.active:
+            return False
         return (
             bool(getattr(self, "_predictor_ready", False))
             and epoch >= int(activation.get("min_epoch", 10))
@@ -390,6 +490,8 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
         metrics.update(predictor_metrics)
         self._predictor_observed_rollouts += int(predictor_metrics.get("predictor/observed_rollouts", 0))
         self._predictor_ready = bool(predictor_metrics.get("predictor/calibration_ready", 0.0))
+        if getattr(self, "_d2_quality", None) is not None:
+            self._predictor_ready = self._d2_quality.active
         metrics["predictor/observed_rollouts_cumulative"] = self._predictor_observed_rollouts
 
     def fit(self):
@@ -417,6 +519,7 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
         self.max_steps_duration = 0
         self._predictor_observed_rollouts = 0
         self._predictor_ready = False
+        self._init_d2_quality()
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -457,8 +560,14 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
         num_prompt_in_batch = 0
         num_gen_batches = 0
         current_epoch = self.global_steps // len(self.train_dataloader)
+        if self._d2_quality is not None:
+            current_epoch = getattr(self, "_d2_rl_epoch", 0)
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
+            self._d2_rl_epoch = epoch
+            # Entering epoch e means exactly e RL data passes are completed.
+            # Rejected candidates are only retried at e=10,15,20,... by default.
+            self._d2_epoch_boundary(epoch)
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
@@ -508,7 +617,9 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                     # generate a batch
                     with marked_timer("gen", timing_raw, "red"):
                         # print(f'gen_batch_output{gen_batch_output}')
+                        d2_forecasts = gen_batch_output
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                        self._observe_d2_rollout(d2_forecasts, gen_batch_output, epoch)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
