@@ -64,16 +64,18 @@ Not enabled or submitted as product behavior:
 - vLLM/vLLM-Ascend source patches;
 - exact-trace replay helpers used by experiments.
 
-## Runtime flow
+## Runtime flow (`scheduler=epws`)
 
 1. The trainer repeats each prompt by `rollout.n` as usual.
 2. Until the selected predictor passes its activation gates, no scheduling predictor forward is run and EWS behaves as stable FCFS. D2 also requires an independently validated candidate report.
-3. Once active, the actor performs one prompt-side forward per unique prompt. All sibling rollouts share that prompt prediction.
+3. Once active, the actor extracts one prompt representation per contiguous `rollout.n` sibling group. Siblings share that prediction; identical prompts in separate groups are not deduplicated.
 4. D1 maps the scalar ListMLE score to token work using a train-history-only monotone PAVA map. D2 uses `median + risk_weight * (p90 - median)`.
 5. `EPWSAgentLoopManager` keeps a bounded set of rollout requests in flight. Each completion immediately admits the next request; active mode is longest-predicted-work-first.
 6. verl's existing global load balancer chooses the inference server.
 7. After the actor update, D1 learns from the completed rollout batch and refits calibration for future batches. The batch being scheduled never uses its own completion lengths.
 8. D2 never trains in the worker. At completed RL epochs 10, 15, 20, ... the trainer either evaluates an external candidate (while inactive) or checks a five-epoch monitoring window (while active). An admitted head stays frozen; no scheduled refitting occurs.
+
+Admission priorities are computed before each rollout batch. Completion events refill capacity; they do not refresh predictions, migrate running requests, or re-rank the batch using live decode progress.
 
 ## Modules
 
@@ -104,7 +106,7 @@ D2 consumes the hidden-state tap schema declared by a frozen checkpoint and expo
 
 ## Configuration
 
-The scheduler is named EWS. Existing `epws` configuration keys, Python identifiers (including `EPWSAgentLoopManager`), and metric names are retained for backward compatibility. This naming update does not change scheduling behavior.
+The scheduler is named EWS. Existing `epws` configuration keys, Python identifiers (including `EPWSAgentLoopManager`), and metric names are retained. The naming change itself does not rename configuration keys; D2 quality admission is additional behavior described below.
 
 The entry point mirrors `trainer.predictor_reorder` into the actor worker config.
 
@@ -183,7 +185,7 @@ python -m recipe.dapo_predictor.validate_d2 \
   --output /absolute/shared/path/d2-candidate.json
 ```
 
-The utility atomically replaces the report; the candidate weight file itself must be immutable and visible at the same absolute path on every actor rank. The trainer recomputes metrics from the report's grouped sufficient statistics, checks the checkpoint SHA-256 and matching `risk_weight`, and rejects stale/future/overlapping validation. It never trusts a supplied `passed` flag. Publishing is a trusted local handoff, not a cryptographic proof of how an external trainer used its data.
+The utility streams the input rows and atomically replaces the report; it rejects an output path that resolves to the checkpoint or input rows. The candidate weight file itself must be immutable and visible at the same absolute path on every actor rank. The trainer recomputes metrics from the report's grouped sufficient statistics, checks the checkpoint SHA-256 and matching `risk_weight`, and rejects stale/future/overlapping validation. It never trusts a supplied `passed` flag. Publishing is a trusted local handoff, not a cryptographic proof of how an external trainer used its data.
 
 The defaults above are **configurable engineering starting points**, not experimentally calibrated universal thresholds or a statistical significance claim:
 
@@ -198,9 +200,11 @@ Any prompt identity with a censored response is excluded from exact mean/rank/MA
 
 Active monitoring reuses the pre-rollout forecasts (no extra per-epoch fit or post-hoc actor forward), pairs them with completed responses **before DAPO reward filtering**, and pools each five-pass window by prompt identity. One sufficiently supported gross scale/tail violation triggers FCFS at the boundary; ranking failure requires two consecutive supported bad windows by default. Missing/insufficient monitoring evidence also suspends scheduling at the boundary; invalid numeric rows suspend it immediately. No fallback rewrites the completed batch. A suspended checkpoint cannot automatically reactivate: externally fit and validate a new checkpoint, publish a new report, and wait for the next boundary. There is no D1/D2 backend switch.
 
-Monitoring state, incomplete-window statistics, boundary counters, the selected checkpoint path/hash, and the in-progress RL epoch are saved with the trainer. Resume verifies the same quality configuration and weight hash. Missing legacy quality state returns to FCFS admission rather than trusting an old activation flag. Do not overwrite admitted weights in place.
+Monitoring state, incomplete-window statistics, boundary counters, the selected checkpoint path/hash, and the in-progress RL epoch are saved with the trainer. Resume validates counters, grouped statistics, readiness consistency, temporal boundaries, the same quality configuration, and the weight hash **before** loading a candidate onto workers. Missing legacy quality state returns to FCFS admission rather than trusting an old activation flag; a backend mismatch is rejected. Checkpoint snapshots do not alias a live monitor window. Do not overwrite admitted weights in place; saving a changed admitted file also fails explicitly.
 
-For an already validated matching candidate, `activation.min_epoch=0` and `min_samples=0` explicitly permit admission at startup; the report must still have a valid completed historical validation epoch. See the current report boundary checks when choosing the historical run origin. For short training runs, **20 total RL epochs is a recommendation**, not a hard disable gate: the recipe only warns below 20. Decide whether warm-up and forward overhead can be amortized. D1 is unchanged.
+The current runtime monitor identifies prompts by unpadded text token IDs. Nonempty `multi_modal_data` suspends quality-mode D2 and uses FCFS before predictor forward, rather than merging different images under the same text identity. Multimodal quality admission is not claimed. A cross-rank candidate-load RPC failure aborts training with readiness cleared; it does not silently continue with mixed heads.
+
+For an already validated matching candidate, `activation.min_epoch=0` and `min_samples=0` explicitly permit admission at startup; the report's epochs then describe the completed historical fitting/validation run. This historical exception is only available at the explicit zero-warm-up startup boundary; later candidate checks must use recent completed epochs of the current run. For short training runs, **20 total RL epochs is a recommendation**, not a hard disable gate: the recipe only warns below 20. Decide whether warm-up and forward overhead can be amortized. D1 fitting and calibration are unchanged.
 
 For exact legacy epoch/sample-only D2 behavior, explicitly set `d2_lifecycle.enable=false` and provide `d2_checkpoint`; no new quality protection is then claimed. Existing D2 launch configurations must either provide a report or select this compatibility mode. D1's `predictor_reorder.epochs` remains the number of ListMLE fitting iterations per update; it is unrelated to these RL epoch boundaries.
 
@@ -222,7 +226,7 @@ PYTHONPATH=/workspace/verl python recipe/dapo_predictor/main_dapo_predictor_reor
 
 ## Correctness and fallback guarantees
 
-- Missing, non-finite, negative, or incomplete predictions fail closed to FCFS.
+- Missing, nonnumeric, non-finite, negative, or incomplete predicted-work values fail closed to stable FCFS for the entire EWS batch. Structurally misaligned protocol batches still raise explicit errors.
 - Dynamic micro-batch reordering is reversed before predictions are attached to prompts.
 - Generated outputs are restored to original batch order before the trainer unions them with training rows.
 - D1 calibration never reads the completion lengths of the rollout batch currently being scheduled.

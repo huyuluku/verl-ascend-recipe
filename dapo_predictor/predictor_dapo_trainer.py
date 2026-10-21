@@ -83,9 +83,9 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
         activation = cfg.get("activation", {})
         config = D2QualityConfig.from_mapping(
             lifecycle.get("quality", {}),
-            warmup_epochs=int(activation.get("min_epoch", 10)),
-            interval_epochs=int(lifecycle.get("interval_epochs", 5)),
-            risk_weight=float(cfg.get("risk_weight", 0.5)),
+            warmup_epochs=activation.get("min_epoch", 10),
+            interval_epochs=lifecycle.get("interval_epochs", 5),
+            risk_weight=cfg.get("risk_weight", 0.5),
         )
         self._d2_quality = D2QualityLifecycle(config)
         if self.config.trainer.total_epochs < 20:
@@ -109,7 +109,12 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
         if quality.active and quality.checkpoint_sha256 != previous_hash:
             # Synchronous all-rank load must finish before any scheduled batch.
             # An RPC failure aborts instead of silently running mixed predictors.
-            self.actor_rollout_wg.load_d2_candidate(quality.checkpoint, quality.checkpoint_sha256)
+            try:
+                self.actor_rollout_wg.load_d2_candidate(quality.checkpoint, quality.checkpoint_sha256)
+            except Exception:
+                quality.status = "suspended"
+                self._predictor_ready = False
+                raise
         print(f"D2 quality boundary: {json.dumps(decision, sort_keys=True)}")
 
     def _observe_d2_rollout(self, predictions: DataProto, completed: DataProto, epoch: int):
@@ -162,6 +167,9 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
             d2_checkpoint=self._d2_checkpoint(),
         )
         if getattr(self, "_d2_quality", None) is not None:
+            pinned_digest = self._d2_quality.checkpoint_sha256
+            if pinned_digest is not None and state.get("d2_checkpoint_sha256") != pinned_digest:
+                raise ValueError("frozen D2 checkpoint changed since admission")
             state["d2_quality"] = self._d2_quality.state_dict()
             state["d2_rl_epoch"] = getattr(self, "_d2_rl_epoch", 0)
         temporary_state_path = f"{state_path}.tmp-{uuid.uuid4().hex}"
@@ -181,13 +189,33 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
             state = json.load(stream)
         backend = self._predictor_backend()
         if getattr(self, "_d2_quality", None) is not None:
+            if state.get("backend", LINEAR_BACKEND) != backend:
+                raise ValueError("predictor backend mismatch on D2 quality resume")
             if "d2_quality" not in state:
                 print("Legacy D2 checkpoint has no quality evidence; restarting admission in FCFS")
                 return result
-            self._d2_quality.load_state_dict(state["d2_quality"])
-            self._d2_rl_epoch = int(state.get("d2_rl_epoch", 0))
-            if self._d2_quality.checkpoint:
-                self.actor_rollout_wg.load_d2_candidate(self._d2_quality.checkpoint, self._d2_quality.checkpoint_sha256)
+            restored = D2QualityLifecycle(self._d2_quality.config)
+            restored.load_state_dict(state["d2_quality"])
+            rl_epoch = state.get("d2_rl_epoch")
+            if (
+                isinstance(rl_epoch, bool)
+                or not isinstance(rl_epoch, int)
+                or rl_epoch < 0
+                or restored.last_boundary > rl_epoch
+                or any(g["epoch"] > rl_epoch + 1 for g in restored.window.groups.values())
+            ):
+                raise ValueError("invalid D2 RL epoch or future monitoring state")
+            checkpoint = restored.checkpoint or self._d2_checkpoint()
+            observed_rollouts, ready = validate_lifecycle_state(state, backend=backend, d2_checkpoint=checkpoint)
+            if ready != restored.active:
+                raise ValueError("D2 readiness disagrees with quality admission state")
+            if restored.checkpoint:
+                self.actor_rollout_wg.load_d2_candidate(restored.checkpoint, restored.checkpoint_sha256)
+            self._d2_quality = restored
+            self._d2_rl_epoch = rl_epoch
+            self._predictor_observed_rollouts = observed_rollouts
+            self._predictor_ready = ready
+            return result
         observed_rollouts, ready = validate_lifecycle_state(
             state,
             backend=backend,
@@ -222,6 +250,19 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
     def _attach_epws_predictions(self, gen_batch: DataProto, epoch: int) -> DataProto:
         """Attach token-scale work only after the train-only activation gates pass."""
         active = self._predictor_active(epoch)
+        if active and getattr(self, "_d2_quality", None) is not None:
+            modal = getattr(gen_batch, "non_tensor_batch", {}).get("multi_modal_data")
+            if modal is not None:
+                values = modal if isinstance(modal, (list, tuple, np.ndarray)) else [modal]
+                if any(value is not None and (not isinstance(value, dict) or bool(value)) for value in values):
+                    self._d2_quality.status = "suspended"
+                    self._predictor_ready = False
+                    active = False
+                    warnings.warn(
+                        "D2 quality monitor supports text prompt identities only; falling back to FCFS",
+                        UserWarning,
+                        stacklevel=2,
+                    )
         if active:
             predictor_output = self.actor_rollout_wg.compute_predictor_score(gen_batch)
             ready = bool(predictor_output.meta_info.get("predictor_ready", False))

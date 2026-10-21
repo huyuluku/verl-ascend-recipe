@@ -40,7 +40,10 @@ def _predicted_work(prompts: DataProto) -> list[float | None]:
         raise ValueError(f"{_PREDICTED_WORK_KEY} has {len(rows)} rows for batch size {len(prompts)}")
     normalized = []
     for value in rows:
-        value = float(value)
+        try:
+            value = float(value) if not isinstance(value, bool) else float("nan")
+        except (TypeError, ValueError, OverflowError):
+            value = float("nan")
         normalized.append(value if math.isfinite(value) and value >= 0 else None)
     return normalized
 
@@ -67,13 +70,17 @@ class EPWSAgentLoopManager(VerlAgentLoopManager):
         if len(prompts) == 0:
             return prompts
 
-        predictor_active = bool(prompts.meta_info.get(_PREDICTOR_ACTIVE_KEY, False))
+        work = _predicted_work(prompts)
+        # Latch one mode for the entire batch. Removing the missing row must
+        # not silently turn a partially invalid FCFS batch back into LPT.
+        predictor_active = bool(prompts.meta_info.get(_PREDICTOR_ACTIVE_KEY, False)) and all(
+            value is not None for value in work
+        )
         lifecycle = PredictorLifecycle(ActivationConfig(min_epoch=0, min_samples=0))
         lifecycle.update(epoch=0, samples=0, ready=predictor_active)
         pool = EPWSWaitingPool(lifecycle)
 
         prompt_ids = _prompt_ids(prompts)
-        work = _predicted_work(prompts)
         pool.add(
             WaitingRequest(
                 request_id=str(index),

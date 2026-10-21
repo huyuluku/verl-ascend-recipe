@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 
 from dapo_predictor.length_scheduler.checkpoint import (
@@ -48,6 +49,7 @@ def trainer_type():
         json=json,
         warnings=warnings,
         torch=torch,
+        np=np,
         build_lifecycle_state=build_lifecycle_state,
         validate_lifecycle_state=validate_lifecycle_state,
     )
@@ -208,6 +210,60 @@ def test_real_trainer_admission_and_resume_load_the_same_hash(trainer_type, tmp_
     assert restored._d2_rl_epoch == 11
     assert restored._predictor_active(11)
     restored.actor_rollout_wg.load_d2_candidate.assert_called_once_with(str(checkpoint), report["checkpoint_sha256"])
+    saved_path = tmp_path / "global_step_3" / "predictor_state.json"
+    saved = json.loads(saved_path.read_text())
+    corruptions = [dict(backend=LINEAR_BACKEND), dict(ready=False), dict(d2_rl_epoch=9), dict(d2_rl_epoch=11.5)]
+    for changed in corruptions:
+        saved_path.write_text(json.dumps(saved | changed))
+        invalid = trainer(trainer_type, lifecycle={"candidate_report": str(path)})
+        invalid.config.trainer.default_local_dir = str(tmp_path)
+        invalid.global_steps = 3
+        with pytest.raises(ValueError):
+            invalid._load_checkpoint()
+        invalid.actor_rollout_wg.load_d2_candidate.assert_not_called()
+        assert not invalid._predictor_ready
+
+
+def test_multimodal_rows_cannot_silently_share_text_identity(trainer_type):
+    value = trainer(trainer_type)
+    value._d2_quality.status = "active"
+    value._predictor_ready = True
+    batch = Proto({})
+    batch.non_tensor_batch = {"multi_modal_data": [{"image": "image-A"}, {"image": "image-B"}]}
+    value.actor_rollout_wg.compute_predictor_score = Mock(side_effect=AssertionError("must not forward"))
+    with pytest.warns(UserWarning, match="text prompt identities only"):
+        output = value._attach_epws_predictions(batch, 10)
+    assert output.meta_info["epws_predictor_active"] is False
+    assert value._d2_quality.status == "suspended"
+    value.actor_rollout_wg.compute_predictor_score.assert_not_called()
+
+
+def test_candidate_rpc_failure_never_leaves_ready_latched(trainer_type, tmp_path):
+    from dapo_predictor.length_scheduler.d2_quality import make_validation_report
+
+    checkpoint = tmp_path / "candidate.pt"
+    checkpoint.write_bytes(b"frozen-head")
+    rows = [
+        dict(
+            prompt_id=str(i),
+            epoch=10,
+            observed=(i + 1) * 100,
+            expected=(i + 1) * 100,
+            median=(i + 1) * 100,
+            p90=(i + 1) * 150,
+        )
+        for i in range(40)
+    ]
+    report = make_validation_report(rows, checkpoint=checkpoint, trained_through_epoch=9, validation_epoch=10)
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps(report))
+    value = trainer(trainer_type, lifecycle={"candidate_report": str(path)})
+    value.actor_rollout_wg.load_d2_candidate.side_effect = RuntimeError("rank rejected file")
+    with pytest.raises(RuntimeError, match="rank rejected"):
+        value._d2_epoch_boundary(10)
+    assert not value._predictor_ready
+    assert not value._predictor_active(10)
+    assert value._d2_quality.status == "suspended"
 
 
 def test_bad_numeric_observation_suspends_immediately(trainer_type):

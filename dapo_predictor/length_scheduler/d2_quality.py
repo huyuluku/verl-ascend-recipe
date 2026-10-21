@@ -10,8 +10,10 @@ import hashlib
 import json
 import math
 import random
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from itertools import combinations
+from numbers import Real
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -49,8 +51,8 @@ class D2QualityConfig:
             if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}")
         for name, value in asdict(self).items():
-            if not math.isfinite(value):
-                raise ValueError(f"{name} must be finite")
+            if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number")
         if not 0.5 < self.min_rank_accuracy <= 1:
             raise ValueError("min_rank_accuracy must be above chance and <= 1")
         if not 0 <= self.min_p90_coverage <= 0.9:
@@ -77,19 +79,52 @@ class QualityWindow:
     """Bounded-by-identity sufficient statistics, never count siblings as prompts."""
 
     def __init__(self, state=None):
-        self.groups = dict(state or {})
+        if state is not None and not isinstance(state, dict):
+            raise ValueError("quality window must be a mapping")
+        self.groups = deepcopy(state or {})
+        for key, group in self.groups.items():
+            if (
+                not isinstance(group, dict)
+                or not isinstance(group.get("prompt_id"), str)
+                or not group["prompt_id"].strip()
+            ):
+                raise ValueError("invalid validation identity")
+            for name in ("epoch", "n", "censored", "covered", "unknown"):
+                value = group.get(name)
+                minimum = 1 if name in ("epoch", "n") else 0
+                if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                    raise ValueError("invalid quality window count")
+            if key != json.dumps([group["epoch"], group["prompt_id"]], separators=(",", ":")):
+                raise ValueError("quality window key/identity mismatch")
+            for name in ("observed", "expected", "median", "p90"):
+                value = group.get(name)
+                if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value < 0:
+                    raise ValueError("invalid quality window length")
+            if (
+                group["censored"] > group["n"]
+                or group["covered"] > group["n"] - group["censored"]
+                or group["unknown"] > group["censored"]
+                or group["p90"] < group["median"]
+            ):
+                raise ValueError("quality window coverage/quantiles contradict counts")
 
     def add(self, *, prompt_id, epoch, observed, expected, median, p90, censored=False):
         values = (observed, expected, median, p90)
-        if not prompt_id or any(not math.isfinite(float(x)) or float(x) < 0 for x in values):
+        if (
+            not isinstance(prompt_id, str)
+            or not prompt_id.strip()
+            or any(isinstance(x, bool) or not isinstance(x, Real) or not math.isfinite(x) or x < 0 for x in values)
+        ):
             raise ValueError("quality observations require identity and finite non-negative lengths")
+        if not isinstance(censored, bool):
+            raise ValueError("censored must be a boolean")
         if float(p90) < float(median):
             raise ValueError("p90 must not be below median")
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
             raise ValueError("observation epoch must be a one-based RL epoch")
         # A prompt may recur in multiple batches; pool all of its siblings.
         key = json.dumps([epoch, str(prompt_id)], separators=(",", ":"))
-        group = self.groups.setdefault(
+        group = self.groups.get(
             key,
             {
                 "epoch": epoch,
@@ -104,14 +139,21 @@ class QualityWindow:
                 "unknown": 0,
             },
         )
+        updates = {
+            name: group[name] + float(value)
+            for name, value in zip(("observed", "expected", "median", "p90"), values, strict=True)
+        }
+        if not all(math.isfinite(value) for value in updates.values()):
+            raise ValueError("quality statistics overflow")
         group["n"] += 1
         for name, value in zip(("observed", "expected", "median", "p90"), values, strict=True):
-            group[name] += float(value)
+            group[name] = updates[name]
         group["censored"] += int(bool(censored))
         if censored and observed <= p90:
             group["unknown"] += 1
         elif not censored and observed <= p90:
             group["covered"] += 1
+        self.groups[key] = group
 
     def metrics(self, config: D2QualityConfig):
         # Aggregate repeated prompt identities too: they are not independent new prompts.
@@ -123,6 +165,8 @@ class QualityWindow:
             )
             for key in target:
                 target[key] += group[key]
+            if not all(math.isfinite(target[key]) for key in ("observed", "expected", "median", "p90")):
+                raise ValueError("pooled quality statistics overflow")
         exact = [g for _, g in sorted(pooled.items()) if not g["censored"]]
         means = [{key: g[key] / g["n"] for key in ("observed", "expected", "median", "p90")} for g in exact]
         correct = 0.0
@@ -145,11 +189,17 @@ class QualityWindow:
                 continue
             score_a = a["median"] + config.risk_weight * (a["p90"] - a["median"])
             score_b = b["median"] + config.risk_weight * (b["p90"] - b["median"])
+            if not math.isfinite(score_a) or not math.isfinite(score_b):
+                raise ValueError("non-finite risk score in quality window")
             predicted = score_a - score_b
             correct += 0.5 if predicted == 0 else float(actual * predicted > 0)
             pairs += 1
         observed = sum(g["observed"] for g in means)
         expected = sum(g["expected"] for g in means)
+        p90_total = sum(g["p90"] for g in means)
+        absolute_error = sum(abs(g["expected"] - g["observed"]) for g in means)
+        if not all(math.isfinite(value) for value in (observed, expected, p90_total, absolute_error)):
+            raise ValueError("aggregate quality statistics overflow")
         count = sum(g["n"] for g in pooled.values())
         known_covered = sum(g["covered"] for g in pooled.values())
         unknown = sum(g["unknown"] for g in pooled.values())
@@ -162,9 +212,9 @@ class QualityWindow:
             "rollouts": count,
             "comparable_pairs": pairs,
             "rank_accuracy": correct / pairs if pairs else None,
-            "normalized_mae": sum(abs(g["expected"] - g["observed"]) for g in means) / observed if observed else None,
+            "normalized_mae": absolute_error / observed if observed else None,
             "scale_ratio": expected / observed if observed else None,
-            "p90_ratio": sum(g["p90"] for g in means) / observed if observed else None,
+            "p90_ratio": p90_total / observed if observed else None,
             "p90_coverage_lower": coverage_lower,
             "p90_coverage_upper": coverage_upper,
             "coverage_known_count": known_covered,
@@ -214,6 +264,13 @@ def make_validation_report(rows, *, checkpoint, trained_through_epoch, validatio
         raise ValueError("validation_epoch must be an integer")
     if not 0 <= trained_through_epoch < validation_epoch:
         raise ValueError("validation must be strictly after the candidate training cutoff")
+    if (
+        isinstance(risk_weight, bool)
+        or not isinstance(risk_weight, Real)
+        or not math.isfinite(risk_weight)
+        or risk_weight < 0
+    ):
+        raise ValueError("risk_weight must be finite and non-negative")
     window = QualityWindow()
     for row in rows:
         if not trained_through_epoch < row["epoch"] <= validation_epoch:
@@ -260,7 +317,15 @@ class D2QualityLifecycle:
             return None
         self.last_boundary = completed_epochs
         if self.active:
-            decision = assess(self.window.metrics(self.config), self.config)
+            try:
+                decision = assess(self.window.metrics(self.config), self.config)
+            except (ValueError, OverflowError) as error:
+                decision = {
+                    "passed": False,
+                    "sufficient": False,
+                    "severe": True,
+                    "reasons": [f"invalid_monitor: {error}"],
+                }
             if decision["sufficient"]:
                 self.bad_windows = 0 if decision["passed"] else self.bad_windows + 1
                 if decision["severe"] or self.bad_windows >= self.config.bad_windows_before_fallback:
@@ -293,29 +358,11 @@ class D2QualityLifecycle:
                     checkpoint = Path(report["checkpoint"])
                     if not checkpoint.is_absolute() or file_sha256(checkpoint) != report["checkpoint_sha256"]:
                         raise ValueError("candidate checkpoint SHA-256 mismatch")
-                    # Reconstruct through the validating accumulator, do not trust supplied metrics.
-                    if not isinstance(report["groups"], dict):
-                        raise ValueError("validation groups must be a mapping")
+                    # Validate grouped state centrally; never trust supplied metrics.
                     window = QualityWindow(report["groups"])
                     for group in window.groups.values():
-                        if not isinstance(group, dict) or not isinstance(group.get("prompt_id"), str):
-                            raise ValueError("invalid validation identity")
-                        for key in ("epoch", "n", "censored", "covered", "unknown"):
-                            if isinstance(group[key], bool) or not isinstance(group[key], int):
-                                raise ValueError("validation counts must be integers")
                         if not start < group["epoch"] <= end:
                             raise ValueError("validation group overlaps training cutoff")
-                        if group["n"] <= 0 or not 0 <= group["censored"] <= group["n"]:
-                            raise ValueError("invalid validation counts")
-                        if any(
-                            not math.isfinite(group[k]) or group[k] < 0
-                            for k in ("observed", "expected", "median", "p90", "covered", "unknown")
-                        ):
-                            raise ValueError("invalid validation lengths")
-                        if group["p90"] < group["median"] or group["covered"] + group["unknown"] > group["n"]:
-                            raise ValueError("invalid validation quantiles or coverage counts")
-                        if group["covered"] > group["n"] - group["censored"] or group["unknown"] > group["censored"]:
-                            raise ValueError("coverage counts contradict censoring")
                     if not window.groups or max(g["epoch"] for g in window.groups.values()) != end:
                         raise ValueError("validation report has no rows from its declared final epoch")
                     decision = assess(window.metrics(self.config), self.config)
@@ -332,28 +379,74 @@ class D2QualityLifecycle:
         return self.last_decision
 
     def state_dict(self):
-        return {
-            "schema_version": 1,
-            "config": asdict(self.config),
-            "status": self.status,
-            "last_boundary": self.last_boundary,
-            "bad_windows": self.bad_windows,
-            "checkpoint": self.checkpoint,
-            "checkpoint_sha256": self.checkpoint_sha256,
-            "report_sha256": self.report_sha256,
-            "last_decision": self.last_decision,
-            "window": self.window.groups,
-        }
+        return deepcopy(
+            {
+                "schema_version": 1,
+                "config": asdict(self.config),
+                "status": self.status,
+                "last_boundary": self.last_boundary,
+                "bad_windows": self.bad_windows,
+                "checkpoint": self.checkpoint,
+                "checkpoint_sha256": self.checkpoint_sha256,
+                "report_sha256": self.report_sha256,
+                "last_decision": self.last_decision,
+                "window": self.window.groups,
+            }
+        )
 
     def load_state_dict(self, state):
-        if state.get("schema_version") != 1 or state.get("config") != asdict(self.config):
+        if (
+            not isinstance(state, dict)
+            or state.get("schema_version") != 1
+            or state.get("config") != asdict(self.config)
+        ):
             raise ValueError("D2 quality checkpoint configuration mismatch")
+        required = {
+            "status",
+            "last_boundary",
+            "bad_windows",
+            "checkpoint",
+            "checkpoint_sha256",
+            "report_sha256",
+            "last_decision",
+            "window",
+        }
+        if not required.issubset(state) or isinstance(state["schema_version"], bool):
+            raise ValueError("incomplete D2 quality checkpoint state")
         if state.get("status") not in ("waiting", "active", "suspended"):
             raise ValueError("invalid D2 quality status")
+        for name in ("last_boundary", "bad_windows"):
+            value = state.get(name)
+            minimum = -1 if name == "last_boundary" else 0
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError("invalid D2 quality checkpoint counter")
+        boundary = state["last_boundary"]
+        if boundary != -1 and (
+            boundary < self.config.warmup_epochs or (boundary - self.config.warmup_epochs) % self.config.interval_epochs
+        ):
+            raise ValueError("D2 checkpoint boundary is not on the configured epoch grid")
+        window = QualityWindow(state.get("window"))
+        if any(g["epoch"] <= boundary for g in window.groups.values()):
+            raise ValueError("D2 checkpoint monitoring window predates its boundary")
+        if state.get("checkpoint") is not None and not isinstance(state["checkpoint"], str):
+            raise ValueError("invalid D2 checkpoint path")
+        if state.get("checkpoint"):
+            for name in ("checkpoint_sha256", "report_sha256"):
+                digest = state.get(name)
+                if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                    raise ValueError("invalid D2 checkpoint SHA-256")
         if state["checkpoint"] and file_sha256(state["checkpoint"]) != state["checkpoint_sha256"]:
             raise ValueError("frozen D2 checkpoint SHA-256 mismatch on resume")
         if state["status"] == "active" and not state["checkpoint"]:
             raise ValueError("active D2 state requires a checkpoint")
+        if state["status"] == "active" and boundary == -1:
+            raise ValueError("active D2 state requires an admission boundary")
+        if not isinstance(state["last_decision"], dict):
+            raise ValueError("invalid D2 quality decision state")
+        if state["checkpoint"] is None and (
+            state["checkpoint_sha256"] is not None or state["report_sha256"] is not None
+        ):
+            raise ValueError("D2 checkpoint identity is incomplete")
         for key in (
             "status",
             "last_boundary",
@@ -363,5 +456,5 @@ class D2QualityLifecycle:
             "report_sha256",
             "last_decision",
         ):
-            setattr(self, key, state[key])
-        self.window = QualityWindow(state["window"])
+            setattr(self, key, deepcopy(state[key]))
+        self.window = window

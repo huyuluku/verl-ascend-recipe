@@ -56,3 +56,22 @@ def test_manager_admits_long_first_and_restores_original_batch_order() -> None:
     assert output.batch["row_id"].tolist() == [0, 1, 2]
     assert output.meta_info["timing"]["epws/predicted_long_first"] == 3
     assert output.meta_info["timing"]["epws/fcfs_fallback"] == 0
+
+
+@pytest.mark.parametrize("invalid", [None, float("nan"), float("inf"), -1.0, "bad", True])
+def test_manager_keeps_the_entire_incomplete_batch_in_fcfs(invalid):
+    starts = []
+    manager = EPWSAgentLoopManager.__new__(EPWSAgentLoopManager)
+    manager.config = SimpleNamespace(trainer={"predictor_reorder": {"epws": {"max_concurrent_requests": 1}}})
+    manager.server_handles = [object()]
+    manager.agent_loop_workers = [_FakeWorker(starts)]
+    manager._performance_metrics = MethodType(lambda self, metrics, output: {}, manager)
+    prompts = DataProto.from_dict(
+        tensors={"row_id": torch.tensor([0, 1, 2])},
+        non_tensors={"epws_predicted_work": np.asarray([invalid, 1.0, 100.0], dtype=object)},
+        meta_info={"epws_predictor_active": True},
+    )
+    output = manager.generate_sequences(prompts)
+    assert starts == [0, 1, 2]
+    assert output.batch["row_id"].tolist() == [0, 1, 2]
+    assert output.meta_info["timing"]["epws/fcfs_fallback"] == 3
